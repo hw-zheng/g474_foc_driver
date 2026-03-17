@@ -17,6 +17,32 @@
 #define SQRT3_OVER_2   0.86602540378f
 #define Q31_TO_FLOAT   (1.0f / 2147483648.0f)
 
+/* ---------- Timing monitor (DWT cycle counter) -------------------------- */
+#if defined(DWT) && defined(DWT_CTRL_CYCCNTENA_Msk) && \
+    defined(CoreDebug) && defined(CoreDebug_DEMCR_TRCENA_Msk)
+#define MOTOR_DWT_AVAILABLE 1u
+#else
+#define MOTOR_DWT_AVAILABLE 0u
+#endif
+
+static inline void Motor_EnableCycleCounter(void)
+{
+#if (MOTOR_DWT_AVAILABLE == 1u)
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0u;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+#endif
+}
+
+static inline uint32_t Motor_ReadCycleCounter(void)
+{
+#if (MOTOR_DWT_AVAILABLE == 1u)
+    return DWT->CYCCNT;
+#else
+    return 0u;
+#endif
+}
+
 /* ---------- Helper ------------------------------------------------------- */
 static inline uint16_t Motor_ClampCmp(int32_t val)
 {
@@ -37,13 +63,21 @@ void Motor_Init(Motor_HandleTypeDef *hmotor,
     hmotor->hcordic  = hcordic;
     hmotor->hencoder = hencoder;
     hmotor->modulation_index = 0.0f;
+    hmotor->elec_offset_q31 = 0u;
     hmotor->cmp_a    = MOTOR_HRTIM_PERIOD >> 1;   /* 50 % initial duty */
     hmotor->cmp_b    = MOTOR_HRTIM_PERIOD >> 1;
     hmotor->cmp_c    = MOTOR_HRTIM_PERIOD >> 1;
+    hmotor->apply_cycles_last = 0u;
+    hmotor->apply_cycles_max = 0u;
+    hmotor->apply_overrun_count = 0u;
+    hmotor->apply_budget_cycles = SystemCoreClock / MOTOR_PWM_FREQ_HZ;
+    if (hmotor->apply_budget_cycles == 0u) hmotor->apply_budget_cycles = 1u;
     hmotor->running  = 0u;
 
-    /* Ensure Timer C preload is enabled (CubeMX may leave it disabled) */
-    SET_BIT(hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_C].TIMxCR,
+    Motor_EnableCycleCounter();
+
+    /* Ensure C-phase timer preload is enabled (Timer E in this board map) */
+    SET_BIT(hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_E].TIMxCR,
             HRTIM_TIMCR_PREEN);
 
     /* Configure CORDIC once: sine function, q1.31, 1-write / 2-read */
@@ -60,7 +94,7 @@ void Motor_Init(Motor_HandleTypeDef *hmotor,
     /* Write initial 50 % compare values */
     hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = hmotor->cmp_a;
     hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_B].CMP1xR = hmotor->cmp_b;
-    hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_C].CMP1xR = hmotor->cmp_c;
+    hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_E].CMP1xR = hmotor->cmp_c;
 }
 
 /* ======================================================================== */
@@ -74,15 +108,15 @@ void Motor_Start(Motor_HandleTypeDef *hmotor)
     __HAL_HRTIM_TIMER_ENABLE_IT(hmotor->hhrtim, HRTIM_TIMERINDEX_TIMER_A,
                                  HRTIM_TIM_IT_REP);
 
-    /* Turn on six complementary outputs (TA1/TA2, TB1/TB2, TC1/TC2) */
+    /* Turn on six complementary outputs (TA1/TA2, TB1/TB2, TE1/TE2) */
     HAL_HRTIM_WaveformOutputStart(hmotor->hhrtim,
         HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
         HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 |
-        HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
+        HRTIM_OUTPUT_TE1 | HRTIM_OUTPUT_TE2);
 
-    /* Start Timer A / B / C counters */
+    /* Start Timer A / B / E counters */
     HAL_HRTIM_WaveformCountStart(hmotor->hhrtim,
-        HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_C);
+        HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_E);
 }
 
 /* ======================================================================== */
@@ -98,10 +132,10 @@ void Motor_Stop(Motor_HandleTypeDef *hmotor)
     HAL_HRTIM_WaveformOutputStop(hmotor->hhrtim,
         HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
         HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 |
-        HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
+        HRTIM_OUTPUT_TE1 | HRTIM_OUTPUT_TE2);
 
     HAL_HRTIM_WaveformCountStop(hmotor->hhrtim,
-        HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_C);
+        HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_E);
 }
 
 /* ======================================================================== */
@@ -112,6 +146,14 @@ void Motor_SetModulation(Motor_HandleTypeDef *hmotor, float mod)
     if (mod < 0.0f) mod = 0.0f;
     if (mod > 1.0f) mod = 1.0f;
     hmotor->modulation_index = mod;
+}
+
+/* ======================================================================== */
+/*  Motor_SetElecOffset                                                     */
+/* ======================================================================== */
+void Motor_SetElecOffset(Motor_HandleTypeDef *hmotor, uint32_t offset_q31)
+{
+    hmotor->elec_offset_q31 = offset_q31;
 }
 
 /* ======================================================================== */
@@ -126,6 +168,59 @@ void Motor_PeriodElapsedCallback(Motor_HandleTypeDef *hmotor)
 }
 
 /* ======================================================================== */
+/*  Motor_ApplySPWM – reusable CORDIC→CMP core                             */
+/*  Compute 3-phase compare values from a given elec angle and modulation   */
+/* ======================================================================== */
+void Motor_ApplySPWM(Motor_HandleTypeDef *hmotor, int32_t elec_angle_q31, float modulation)
+{
+    uint32_t start_cycles = Motor_ReadCycleCounter();
+
+    if (modulation < 0.0f) modulation = 0.0f;
+    if (modulation > 1.0f) modulation = 1.0f;
+
+    /* CORDIC hardware-accelerated sin/cos (polling, ≈6 cycles) */
+    WRITE_REG(hmotor->hcordic->Instance->WDATA, (uint32_t)elec_angle_q31);
+    while (__HAL_CORDIC_GET_FLAG(hmotor->hcordic, CORDIC_FLAG_RRDY) == 0U) {}
+    int32_t sin_q31 = (int32_t)READ_REG(hmotor->hcordic->Instance->RDATA);
+    int32_t cos_q31 = (int32_t)READ_REG(hmotor->hcordic->Instance->RDATA);
+
+    float sin_f = (float)sin_q31 * Q31_TO_FLOAT;
+    float cos_f = (float)cos_q31 * Q31_TO_FLOAT;
+
+    /*  Va = sin(θe)
+     *  Vb = sin(θe − 120°) = −0.5·sin − (√3/2)·cos
+     *  Vc = sin(θe + 120°) = −0.5·sin + (√3/2)·cos
+     *  CMP = Period/2 × (1 + m · Vx)                                      */
+    float half = (float)(MOTOR_HRTIM_PERIOD >> 1);
+
+    float va = sin_f;
+#if (MOTOR_PHASE_SEQUENCE_ABC == 1u)
+    float vb = -0.5f * sin_f - SQRT3_OVER_2 * cos_f;
+    float vc = -0.5f * sin_f + SQRT3_OVER_2 * cos_f;
+#else
+    float vb = -0.5f * sin_f + SQRT3_OVER_2 * cos_f;
+    float vc = -0.5f * sin_f - SQRT3_OVER_2 * cos_f;
+#endif
+
+    int32_t ca = (int32_t)(half + half * modulation * va);
+    int32_t cb = (int32_t)(half + half * modulation * vb);
+    int32_t cc = (int32_t)(half + half * modulation * vc);
+
+    hmotor->cmp_a = Motor_ClampCmp(ca);
+    hmotor->cmp_b = Motor_ClampCmp(cb);
+    hmotor->cmp_c = Motor_ClampCmp(cc);
+
+    hmotor->hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = hmotor->cmp_a;
+    hmotor->hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_B].CMP1xR = hmotor->cmp_b;
+    hmotor->hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_E].CMP1xR = hmotor->cmp_c;
+
+    uint32_t elapsed = Motor_ReadCycleCounter() - start_cycles;
+    hmotor->apply_cycles_last = elapsed;
+    if (elapsed > hmotor->apply_cycles_max) hmotor->apply_cycles_max = elapsed;
+    if (elapsed > hmotor->apply_budget_cycles) hmotor->apply_overrun_count++;
+}
+
+/* ======================================================================== */
 /*  Motor_EncoderReadCompleteCallback                                       */
 /*  Called from SPI-DMA complete ISR → CORDIC → update HRTIM CMP           */
 /* ======================================================================== */
@@ -133,47 +228,10 @@ void Motor_EncoderReadCompleteCallback(Motor_HandleTypeDef *hmotor)
 {
     if (!hmotor->running) return;
 
-    /* ---- 1. Read mechanical angle from encoder ------------------------- */
     uint16_t raw = MT6826_GetAngleRaw(hmotor->hencoder);
+    int32_t elec_q31 = (int32_t)(
+        (uint32_t)raw * MOTOR_ANGLE_SCALE + hmotor->elec_offset_q31
+    );
 
-    /* ---- 2. Mechanical → electrical angle (q1.31, circular) ------------ */
-    /*   elec_q31 = raw × POLE_PAIRS × 2^32 / 32768                       */
-    /*   uint32 multiplication naturally wraps → circular angle            */
-    int32_t elec_q31 = (int32_t)((uint32_t)raw * MOTOR_ANGLE_SCALE);
-
-    /* ---- 3. CORDIC hardware-accelerated sin/cos (polling, ≈6 cycles) --- */
-    WRITE_REG(hmotor->hcordic->Instance->WDATA, (uint32_t)elec_q31);
-    while (__HAL_CORDIC_GET_FLAG(hmotor->hcordic, CORDIC_FLAG_RRDY) == 0U) {}
-    int32_t sin_q31 = (int32_t)READ_REG(hmotor->hcordic->Instance->RDATA);
-    int32_t cos_q31 = (int32_t)READ_REG(hmotor->hcordic->Instance->RDATA);
-
-    /* ---- 4. q1.31 → float --------------------------------------------- */
-    float sin_f = (float)sin_q31 * Q31_TO_FLOAT;
-    float cos_f = (float)cos_q31 * Q31_TO_FLOAT;
-
-    /* ---- 5. Three-phase SPWM ------------------------------------------- *
-     *   Va = sin(θe)
-     *   Vb = sin(θe − 120°) = −0.5·sin − (√3/2)·cos
-     *   Vc = sin(θe + 120°) = −0.5·sin + (√3/2)·cos
-     *
-     *   CMP = Period/2 × (1 + m · Vx)     where m = modulation index      */
-    float m    = hmotor->modulation_index;
-    float half = (float)(MOTOR_HRTIM_PERIOD >> 1);
-
-    float va = sin_f;
-    float vb = -0.5f * sin_f - SQRT3_OVER_2 * cos_f;
-    float vc = -0.5f * sin_f + SQRT3_OVER_2 * cos_f;
-
-    int32_t ca = (int32_t)(half + half * m * va);
-    int32_t cb = (int32_t)(half + half * m * vb);
-    int32_t cc = (int32_t)(half + half * m * vc);
-
-    hmotor->cmp_a = Motor_ClampCmp(ca);
-    hmotor->cmp_b = Motor_ClampCmp(cb);
-    hmotor->cmp_c = Motor_ClampCmp(cc);
-
-    /* ---- 6. Write CMP1 preload registers (shadow → active at next period) */
-    hmotor->hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = hmotor->cmp_a;
-    hmotor->hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_B].CMP1xR = hmotor->cmp_b;
-    hmotor->hhrtim->Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_C].CMP1xR = hmotor->cmp_c;
+    Motor_ApplySPWM(hmotor, elec_q31, hmotor->modulation_index);
 }

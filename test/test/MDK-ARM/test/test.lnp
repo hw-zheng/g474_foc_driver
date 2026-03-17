@@ -20,11 +20,15 @@
 "test\stm32g4xx_hal_hrtim.o"
 "test\stm32g4xx_hal_spi.o"
 "test\stm32g4xx_hal_spi_ex.o"
+"test\stm32g4xx_hal_tim.o"
+"test\stm32g4xx_hal_tim_ex.o"
 "test\stm32g4xx_hal_uart.o"
 "test\stm32g4xx_hal_uart_ex.o"
 "test\system_stm32g4xx.o"
 "test\motor.o"
 "test\mt6826.o"
+"test\spwm.o"
+"test\ui.o"
 --strict --scatter "stm32g474xx_flash.sct"
 --summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
 --info sizes --info totals --info unused --info veneers

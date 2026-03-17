@@ -24,6 +24,8 @@
 #include <stdio.h>
 #include "mt6826.h"
 #include "motor.h"
+#include "spwm.h"
+#include "ui.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,7 +44,6 @@
 
 /* Private variables ---------------------------------------------------------*/
 CORDIC_HandleTypeDef hcordic;
-DMA_HandleTypeDef hdma_cordic_read;
 
 HRTIM_HandleTypeDef hhrtim1;
 
@@ -50,12 +51,20 @@ SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_rx;
 DMA_HandleTypeDef hdma_spi1_tx;
 
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim8;
+TIM_HandleTypeDef htim17;
+
 UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_rx;
+DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
-static uint8_t          uart_buf[64];    /* UART 发送缓冲 */
+static uint8_t          uart_buf[64];    /* UART 发送缓冲（保留备用） */
 MT6826_HandleTypeDef    hencoder;        /* 磁编码器句柄   */
 Motor_HandleTypeDef     hmotor;          /* 电机驱动句柄   */
+SPWM_HandleTypeDef      hspwm;           /* SPWM 位置环句柄 */
+UI_HandleTypeDef        hui;             /* UI 参数调节句柄 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -66,6 +75,9 @@ static void MX_USART1_UART_Init(void);
 static void MX_HRTIM1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_CORDIC_Init(void);
+static void MX_TIM17_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM8_Init(void);
 /* USER CODE BEGIN PFP */
 /* USER CODE END PFP */
 
@@ -107,18 +119,37 @@ int main(void)
   MX_HRTIM1_Init();
   MX_SPI1_Init();
   MX_CORDIC_Init();
+  MX_TIM17_Init();
+  MX_TIM3_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
   /* NSS2 空闲拉高 */
   HAL_GPIO_WritePin(SPI1_NSS2_GPIO_Port, SPI1_NSS2_Pin, GPIO_PIN_SET);
 
-  /* 初始化 MT6826S 编码器模块 (NSS1 拉高, 构建 DMA 命令帧) */
+  /* 初始化 MT6826S 编码器模块 */
   MT6826_Init(&hencoder, &hspi1, SPI1_NSS1_GPIO_Port, SPI1_NSS1_Pin);
-  HAL_Delay(10u);   /* 等待 MT6826S 上电稳定 */
+  HAL_Delay(10u);
 
-  /* 初始化 SPWM 电机驱动模块 */
+  /* 初始化电机底层 HRTIM+CORDIC */
   Motor_Init(&hmotor, &hhrtim1, &hcordic, &hencoder);
-  Motor_SetModulation(&hmotor, 0.8f);
-  Motor_Start(&hmotor);
+
+  /* 初始化 SPWM 位置环（先初始化再进行对齐） */
+  SPWM_Init(&hspwm, &hmotor, &htim17);
+  SPWM_SetPID(&hspwm, 0.02f, 0.0005f, 0.0f);
+	
+	/* d轴对齐: 施加直轴电流使电机转至电角度0°, 标定编码器偏移 */
+  SPWM_AlignToZero(&hspwm);
+	
+//	/*电机匀速旋转测试*/
+//	Motor_SetModulation(&hmotor,0.5f);
+//	Motor_Start(&hmotor);
+
+  /* 启动闭环位置控制, 目标角度 0° */
+  SPWM_SetTarget(&hspwm, 0.0f);
+  SPWM_Start(&hspwm);
+
+  /* 初始化 UI: 旋钮(TIM3) + 按钮(PB7) + FireWater 串口流(TIM8) */
+  UI_Init(&hui, &hspwm, &huart1, &htim3, &htim8);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -128,16 +159,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    {
-      /* 电机 SPWM 运行于中断驱动模式，主循环仅做调试输出 */
-      int len;
-      float deg = (float)hencoder.angle_raw * 360.0f / 32768.0f;
-      len = snprintf((char *)uart_buf, sizeof(uart_buf),
-                     "Ang:%6.2f  A:%5u B:%5u C:%5u\r\n",
-                     (double)deg, hmotor.cmp_a, hmotor.cmp_b, hmotor.cmp_c);
-      HAL_UART_Transmit(&huart1, uart_buf, (uint16_t)len, 100u);
-    }
-    HAL_Delay(500u);
+    /* 串口输出和角度数据均由 TIM8 中断驱动 (UI_TIM8Callback)，
+     * 主循环只需轮询编码器增量和按键消抖。                        */
+    UI_Poll(&hui);
   }
   /* USER CODE END 3 */
 }
@@ -351,9 +375,8 @@ static void MX_HRTIM1_Init(void)
   {
     Error_Handler();
   }
-  pTimerCfg.PreloadEnable = HRTIM_PRELOAD_DISABLED;
-  pTimerCfg.RepetitionUpdate = HRTIM_UPDATEONREPETITION_DISABLED;
-  if (HAL_HRTIM_WaveformTimerConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C, &pTimerCfg) != HAL_OK)
+  pTimerCfg.DelayedProtectionMode = HRTIM_TIMER_D_E_DELAYEDPROTECTION_DISABLED;
+  if (HAL_HRTIM_WaveformTimerConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_E, &pTimerCfg) != HAL_OK)
   {
     Error_Handler();
   }
@@ -379,7 +402,7 @@ static void MX_HRTIM1_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_HRTIM_DeadTimeConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C, &pDeadTimeCfg) != HAL_OK)
+  if (HAL_HRTIM_DeadTimeConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_E, &pDeadTimeCfg) != HAL_OK)
   {
     Error_Handler();
   }
@@ -399,7 +422,7 @@ static void MX_HRTIM1_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_HRTIM_WaveformOutputConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C, HRTIM_OUTPUT_TC1, &pOutputCfg) != HAL_OK)
+  if (HAL_HRTIM_WaveformOutputConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_E, HRTIM_OUTPUT_TE1, &pOutputCfg) != HAL_OK)
   {
     Error_Handler();
   }
@@ -413,7 +436,7 @@ static void MX_HRTIM1_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_HRTIM_WaveformOutputConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C, HRTIM_OUTPUT_TC2, &pOutputCfg) != HAL_OK)
+  if (HAL_HRTIM_WaveformOutputConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_E, HRTIM_OUTPUT_TE2, &pOutputCfg) != HAL_OK)
   {
     Error_Handler();
   }
@@ -429,20 +452,16 @@ static void MX_HRTIM1_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_HRTIM_TimeBaseConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C, &pTimeBaseCfg) != HAL_OK)
+  if (HAL_HRTIM_TimeBaseConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_E, &pTimeBaseCfg) != HAL_OK)
   {
     Error_Handler();
   }
-  pTimerCtl.GreaterCMP3 = HRTIM_TIMERGTCMP3_EQUAL;
-  if (HAL_HRTIM_WaveformTimerControl(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C, &pTimerCtl) != HAL_OK)
+  if (HAL_HRTIM_WaveformTimerControl(&hhrtim1, HRTIM_TIMERINDEX_TIMER_E, &pTimerCtl) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_HRTIM_WaveformCompareConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C, HRTIM_COMPAREUNIT_1, &pCompareCfg) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_HRTIM_WaveformCompareConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C, HRTIM_COMPAREUNIT_3, &pCompareCfg) != HAL_OK)
+  pCompareCfg.CompareValue = 0xFFDF;
+  if (HAL_HRTIM_WaveformCompareConfig(&hhrtim1, HRTIM_TIMERINDEX_TIMER_E, HRTIM_COMPAREUNIT_1, &pCompareCfg) != HAL_OK)
   {
     Error_Handler();
   }
@@ -494,6 +513,134 @@ static void MX_SPI1_Init(void)
 }
 
 /**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * @brief TIM8 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM8_Init(void)
+{
+
+  /* USER CODE BEGIN TIM8_Init 0 */
+
+  /* USER CODE END TIM8_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM8_Init 1 */
+
+  /* USER CODE END TIM8_Init 1 */
+  htim8.Instance = TIM8;
+  htim8.Init.Prescaler = 15;
+  htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim8.Init.Period = 999;
+  htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim8.Init.RepetitionCounter = 0;
+  htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim8, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM8_Init 2 */
+
+  /* USER CODE END TIM8_Init 2 */
+
+}
+
+/**
+  * @brief TIM17 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM17_Init(void)
+{
+
+  /* USER CODE BEGIN TIM17_Init 0 */
+
+  /* USER CODE END TIM17_Init 0 */
+
+  /* USER CODE BEGIN TIM17_Init 1 */
+
+  /* USER CODE END TIM17_Init 1 */
+  htim17.Instance = TIM17;
+  htim17.Init.Prescaler = 169;
+  htim17.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim17.Init.Period = 999;
+  htim17.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim17.Init.RepetitionCounter = 0;
+  htim17.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim17) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM17_Init 2 */
+
+  /* USER CODE END TIM17_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -509,7 +656,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 460800;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -558,9 +705,12 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
-  /* DMA1_Channel3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
+  /* DMA1_Channel4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 9, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
+  /* DMA1_Channel5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 9, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
 
 }
 
@@ -592,6 +742,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PB7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
@@ -600,20 +756,22 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 /**
  * @brief  SPI DMA 收发完成回调
- *         → 解析编码器数据 → CORDIC 计算 → 更新 HRTIM 比较值
+ *         → 解析编码器 → SPWM 或 Motor 处理
  */
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 {
     if (hspi->Instance == SPI1)
     {
         MT6826_DMACompleteCallback(&hencoder);
-        Motor_EncoderReadCompleteCallback(&hmotor);
+        if (hspwm.enabled)
+            SPWM_EncoderReadCompleteCallback(&hspwm);
+        else
+            Motor_EncoderReadCompleteCallback(&hmotor);
     }
 }
 
 /**
- * @brief  HRTIM 定时器周期完成回调
- *         → 启动编码器 SPI-DMA 读取
+ * @brief  HRTIM 定时器周期完成回调 → 启动编码器 SPI-DMA 读取
  */
 void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef *hhrtim,
                                        uint32_t TimerIdx)
@@ -621,6 +779,33 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef *hhrtim,
     if (TimerIdx == HRTIM_TIMERINDEX_TIMER_A)
     {
         Motor_PeriodElapsedCallback(&hmotor);
+    }
+}
+
+/**
+ * @brief  TIM17 周期中断回调 → PID 位置环计算 (1 kHz)
+ *         TIM8  周期中断回调 → UI FireWater 数据流 (~10.6 kHz)
+ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM17)
+    {
+        SPWM_PIDCallback(&hspwm);
+    }
+    else if (htim->Instance == TIM8)
+    {
+        UI_TIM8Callback(&hui);
+    }
+}
+
+/**
+ * @brief  UART DMA 发送完成回调 → 释放 UI DMA 锁
+ */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        UI_TxCpltCallback(&hui);
     }
 }
 /* USER CODE END 4 */
